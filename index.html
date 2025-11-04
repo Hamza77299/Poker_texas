@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Firebase Online Poker</title>
     <style>
+        /* All the previous CSS styles remain the same */
         * {
             margin: 0;
             padding: 0;
@@ -697,6 +698,9 @@
             
             updateConnectionStatus(false, 'Disconnected');
             addLogEntry("Enter your name and create or join a game.");
+            
+            // Disable actions initially
+            disablePlayerActions();
         }
 
         // Generate unique ID
@@ -732,7 +736,9 @@
                         name: playerName,
                         chips: 1000,
                         ready: true,
-                        folded: false
+                        folded: false,
+                        currentBet: 0,
+                        hasActed: false
                     }
                 },
                 status: 'waiting',
@@ -742,7 +748,11 @@
                     pot: 0,
                     currentBet: 0,
                     dealerPosition: 0,
-                    currentPlayer: null
+                    currentPlayer: null,
+                    smallBlind: 10,
+                    bigBlind: 20,
+                    deck: [],
+                    bettingRound: 'preflop'
                 },
                 created: Date.now()
             };
@@ -793,7 +803,9 @@
                             name: playerName,
                             chips: 1000,
                             ready: false,
-                            folded: false
+                            folded: false,
+                            currentBet: 0,
+                            hasActed: false
                         });
                     } else {
                         throw new Error('Game not found');
@@ -838,12 +850,110 @@
         // Start the game
         function startGame() {
             if (gameState.isHost) {
-                database.ref('games/' + gameState.gameId + '/status').set('playing')
-                    .then(() => {
-                        // Initialize first hand
-                        startNewHand();
-                    });
+                // Create and shuffle deck
+                const deck = createDeck();
+                shuffleDeck(deck);
+                
+                // Deal cards to players and start first hand
+                startNewHand(deck);
             }
+        }
+
+        // Create a deck of cards
+        function createDeck() {
+            const suits = ['hearts', 'diamonds', 'clubs', 'spades'];
+            const values = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
+            const deck = [];
+            
+            for (let suit of suits) {
+                for (let value of values) {
+                    deck.push({ suit, value });
+                }
+            }
+            return deck;
+        }
+
+        // Shuffle deck using Fisher-Yates algorithm
+        function shuffleDeck(deck) {
+            for (let i = deck.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [deck[i], deck[j]] = [deck[j], deck[i]];
+            }
+            return deck;
+        }
+
+        // Start new hand
+        function startNewHand(deck) {
+            if (!gameState.isHost) return;
+            
+            // Get current players
+            database.ref('games/' + gameState.gameId + '/players').once('value')
+                .then(snapshot => {
+                    const players = snapshot.val();
+                    const playerIds = Object.keys(players);
+                    
+                    if (playerIds.length < 2) {
+                        alert('Need at least 2 players to start the game');
+                        return;
+                    }
+
+                    // Deal cards to players
+                    const playerCards = {};
+                    playerIds.forEach((playerId, index) => {
+                        playerCards[playerId] = [
+                            deck[index * 2],
+                            deck[index * 2 + 1]
+                        ];
+                    });
+
+                    // Set blinds and first player
+                    const smallBlindPos = 0;
+                    const bigBlindPos = 1 % playerIds.length;
+                    const firstPlayerPos = 2 % playerIds.length;
+
+                    // Update game state
+                    const gameStateUpdate = {
+                        status: 'playing',
+                        gameState: {
+                            phase: 'preflop',
+                            communityCards: [],
+                            pot: 30, // Small + big blind
+                            currentBet: 20, // Big blind amount
+                            dealerPosition: 0,
+                            currentPlayer: playerIds[firstPlayerPos],
+                            smallBlind: 10,
+                            bigBlind: 20,
+                            deck: deck.slice(playerIds.length * 2), // Remove dealt cards
+                            bettingRound: 'preflop',
+                            playerCards: playerCards
+                        }
+                    };
+
+                    // Update player bets for blinds
+                    const playerUpdates = {};
+                    playerUpdates[playerIds[smallBlindPos] + '/currentBet'] = 10;
+                    playerUpdates[playerIds[smallBlindPos] + '/chips'] = players[playerIds[smallBlindPos]].chips - 10;
+                    playerUpdates[playerIds[bigBlindPos] + '/currentBet'] = 20;
+                    playerUpdates[playerIds[bigBlindPos] + '/chips'] = players[playerIds[bigBlindPos]].chips - 20;
+
+                    // Reset all players' acted status
+                    playerIds.forEach(playerId => {
+                        playerUpdates[playerId + '/hasActed'] = false;
+                        playerUpdates[playerId + '/folded'] = false;
+                    });
+
+                    // Apply all updates
+                    return Promise.all([
+                        database.ref('games/' + gameState.gameId).update(gameStateUpdate),
+                        database.ref('games/' + gameState.gameId + '/players').update(playerUpdates)
+                    ]);
+                })
+                .then(() => {
+                    addLogEntry("New hand started! Blinds posted.");
+                })
+                .catch(error => {
+                    console.error('Error starting new hand:', error);
+                });
         }
 
         // Switch to lobby view
@@ -876,6 +986,14 @@
                 }
             });
 
+            // Listen for actions
+            database.ref('games/' + gameState.gameId + '/actions').on('child_added', snapshot => {
+                const action = snapshot.val();
+                if (action.playerId !== gameState.playerId && gameState.isHost) {
+                    processPlayerAction(action);
+                }
+            });
+
             // Listen for chat messages
             database.ref('games/' + gameState.gameId + '/chat').on('child_added', snapshot => {
                 const message = snapshot.val();
@@ -890,7 +1008,7 @@
             
             // Update game state
             if (gameData.gameState) {
-                updateGameState(gameData.gameState);
+                updateGameState(gameData.gameState, gameData.players);
             }
             
             // Update game status
@@ -912,18 +1030,40 @@
                         playerSeat.classList.add('active');
                     }
                     
-                    // Show dealer button for first player (simplified)
+                    // Show current turn
+                    const gameStateRef = database.ref('games/' + gameState.gameId + '/gameState/currentPlayer');
+                    gameStateRef.once('value').then(snapshot => {
+                        if (snapshot.val() === playerId) {
+                            playerSeat.classList.add('current-turn');
+                        }
+                    });
+
+                    // Show dealer button for first player
                     if (index === 0) {
                         playerSeat.classList.add('dealer');
                         playerSeat.innerHTML += '<div class="dealer-button">D</div>';
                     }
                     
-                    playerSeat.innerHTML = `
+                    // Show cards only for current player or at showdown
+                    let cardsHTML = '<div class="card card-back">?</div><div class="card card-back">?</div>';
+                    if (playerId === gameState.playerId) {
+                        // Get player's cards from game state
+                        database.ref('games/' + gameState.gameId + '/gameState/playerCards/' + playerId).once('value')
+                            .then(snapshot => {
+                                const cards = snapshot.val();
+                                if (cards && cards.length === 2) {
+                                    const card1 = createCardHTML(cards[0]);
+                                    const card2 = createCardHTML(cards[1]);
+                                    document.getElementById('player-cards-' + playerId).innerHTML = card1 + card2;
+                                }
+                            });
+                    }
+                    
+                    playerSeat.innerHTML += `
                         <div class="player-name">${player.name} ${playerId === gameState.playerId ? '(You)' : ''}</div>
                         <div class="player-chips">$${player.chips}</div>
-                        <div class="player-cards">
-                            <div class="card card-back">?</div>
-                            <div class="card card-back">?</div>
+                        <div class="player-cards" id="player-cards-${playerId}">
+                            ${cardsHTML}
                         </div>
                         <div class="player-bet">Bet: $${player.currentBet || 0}</div>
                         ${player.folded ? '<div style="color: #f44336;">FOLDED</div>' : ''}
@@ -934,10 +1074,29 @@
             }
         }
 
+        // Create card HTML
+        function createCardHTML(card) {
+            if (!card) return '<div class="card card-back">?</div>';
+            
+            const suitSymbol = getSuitSymbol(card.suit);
+            return `
+                <div class="card">
+                    <div class="card-top">
+                        <div class="card-value">${card.value}</div>
+                        <div class="card-suit ${card.suit}">${suitSymbol}</div>
+                    </div>
+                    <div class="card-bottom">
+                        <div class="card-value">${card.value}</div>
+                        <div class="card-suit ${card.suit}">${suitSymbol}</div>
+                    </div>
+                </div>
+            `;
+        }
+
         // Update game state
-        function updateGameState(gameStateData) {
+        function updateGameState(gameStateData, players) {
             potAmountEl.textContent = gameStateData.pot || 0;
-            gamePhaseEl.textContent = gameStateData.phase || 'Waiting';
+            gamePhaseEl.textContent = (gameStateData.bettingRound || 'waiting').toUpperCase();
             
             // Update community cards
             if (gameStateData.communityCards) {
@@ -945,11 +1104,17 @@
             }
             
             // Update current bet display
-            const callAmount = (gameStateData.currentBet || 0) - (gameState.playerBet || 0);
+            const currentPlayerBet = players && players[gameState.playerId] ? players[gameState.playerId].currentBet || 0 : 0;
+            const callAmount = (gameStateData.currentBet || 0) - currentPlayerBet;
             callBtn.textContent = `Call $${callAmount > 0 ? callAmount : 0}`;
             
-            // Update player-specific state
-            if (gameStateData.currentPlayer === gameState.playerId) {
+            // Update player chips
+            if (players && players[gameState.playerId]) {
+                playerChipsEl.textContent = players[gameState.playerId].chips || 1000;
+            }
+            
+            // Enable/disable actions based on turn
+            if (gameStateData.currentPlayer === gameState.playerId && gameStateData.status === 'playing') {
                 addLogEntry("Your turn to act");
                 enablePlayerActions();
             } else {
@@ -961,27 +1126,30 @@
         function displayCommunityCards(cards) {
             communityCardsEl.innerHTML = '';
             
-            cards.forEach(card => {
-                const cardEl = document.createElement('div');
-                cardEl.className = 'card';
-                
-                const suitSymbol = getSuitSymbol(card.suit);
-                cardEl.innerHTML = `
-                    <div class="card-top">
-                        <div class="card-value">${card.value}</div>
-                        <div class="card-suit ${card.suit}">${suitSymbol}</div>
-                    </div>
-                    <div class="card-bottom">
-                        <div class="card-value">${card.value}</div>
-                        <div class="card-suit ${card.suit}">${suitSymbol}</div>
-                    </div>
-                `;
-                
-                communityCardsEl.appendChild(cardEl);
-            });
+            if (cards && cards.length > 0) {
+                cards.forEach(card => {
+                    const cardEl = document.createElement('div');
+                    cardEl.className = 'card';
+                    
+                    const suitSymbol = getSuitSymbol(card.suit);
+                    cardEl.innerHTML = `
+                        <div class="card-top">
+                            <div class="card-value">${card.value}</div>
+                            <div class="card-suit ${card.suit}">${suitSymbol}</div>
+                        </div>
+                        <div class="card-bottom">
+                            <div class="card-value">${card.value}</div>
+                            <div class="card-suit ${card.suit}">${suitSymbol}</div>
+                        </div>
+                    `;
+                    
+                    communityCardsEl.appendChild(cardEl);
+                });
+            }
             
             // Add placeholders for remaining cards
-            const remainingCards = 5 - cards.length;
+            const cardCount = cards ? cards.length : 0;
+            const remainingCards = 5 - cardCount;
             for (let i = 0; i < remainingCards; i++) {
                 const placeholder = document.createElement('div');
                 placeholder.className = 'card';
@@ -1017,10 +1185,171 @@
                 .then(() => {
                     addLogEntry(`You ${action}${betAmount > 0 ? ' $' + betAmount : ''}`);
                     bettingControls.style.display = 'none';
+                    disablePlayerActions(); // Disable until next turn
                 })
                 .catch(error => {
                     console.error('Error sending action:', error);
                 });
+        }
+
+        // Process player action (host only)
+        function processPlayerAction(action) {
+            if (!gameState.isHost) return;
+            
+            const { playerId, action: actionType, betAmount } = action;
+            
+            // Get current game state
+            database.ref('games/' + gameState.gameId).once('value')
+                .then(snapshot => {
+                    const gameData = snapshot.val();
+                    const players = gameData.players;
+                    const gameStateData = gameData.gameState;
+                    
+                    if (gameStateData.currentPlayer !== playerId) {
+                        console.log(`Not ${playerId}'s turn`);
+                        return;
+                    }
+                    
+                    let updates = {};
+                    
+                    switch(actionType) {
+                        case 'fold':
+                            updates[`players/${playerId}/folded`] = true;
+                            addLogEntry(`${players[playerId].name} folds`);
+                            break;
+                            
+                        case 'check':
+                            // Can only check if no bet to call
+                            if (gameStateData.currentBet === (players[playerId].currentBet || 0)) {
+                                addLogEntry(`${players[playerId].name} checks`);
+                            } else {
+                                console.log("Cannot check when there's a bet");
+                                return;
+                            }
+                            break;
+                            
+                        case 'call':
+                            const callAmount = gameStateData.currentBet - (players[playerId].currentBet || 0);
+                            if (callAmount > 0) {
+                                updates[`players/${playerId}/chips`] = (players[playerId].chips || 1000) - callAmount;
+                                updates[`players/${playerId}/currentBet`] = gameStateData.currentBet;
+                                updates[`gameState/pot`] = (gameStateData.pot || 0) + callAmount;
+                                addLogEntry(`${players[playerId].name} calls $${callAmount}`);
+                            }
+                            break;
+                            
+                        case 'bet':
+                        case 'raise':
+                            if (betAmount > 0) {
+                                updates[`players/${playerId}/chips`] = (players[playerId].chips || 1000) - betAmount;
+                                updates[`players/${playerId}/currentBet`] = (players[playerId].currentBet || 0) + betAmount;
+                                updates[`gameState/currentBet`] = (players[playerId].currentBet || 0) + betAmount;
+                                updates[`gameState/pot`] = (gameStateData.pot || 0) + betAmount;
+                                addLogEntry(`${players[playerId].name} ${actionType}s $${betAmount}`);
+                            }
+                            break;
+                    }
+                    
+                    // Mark player as acted
+                    updates[`players/${playerId}/hasActed`] = true;
+                    
+                    // Move to next player
+                    const nextPlayer = getNextPlayer(playerId, players, gameStateData);
+                    if (nextPlayer) {
+                        updates[`gameState/currentPlayer`] = nextPlayer;
+                    } else {
+                        // All players have acted, advance to next betting round
+                        advanceBettingRound(gameStateData, players);
+                    }
+                    
+                    // Apply updates
+                    return database.ref('games/' + gameState.gameId).update(updates);
+                })
+                .catch(error => {
+                    console.error('Error processing action:', error);
+                });
+        }
+
+        // Get next player who can act
+        function getNextPlayer(currentPlayerId, players, gameStateData) {
+            const playerIds = Object.keys(players);
+            const currentIndex = playerIds.indexOf(currentPlayerId);
+            let nextIndex = (currentIndex + 1) % playerIds.length;
+            
+            // Find next non-folded player who hasn't acted
+            let checkedPlayers = 0;
+            while (checkedPlayers < playerIds.length) {
+                const nextPlayerId = playerIds[nextIndex];
+                const nextPlayer = players[nextPlayerId];
+                
+                if (!nextPlayer.folded && !nextPlayer.hasActed) {
+                    return nextPlayerId;
+                }
+                
+                nextIndex = (nextIndex + 1) % playerIds.length;
+                checkedPlayers++;
+            }
+            
+            return null; // All players have acted
+        }
+
+        // Advance to next betting round or end hand
+        function advanceBettingRound(gameStateData, players) {
+            let updates = {};
+            const playerIds = Object.keys(players);
+            
+            // Reset players' acted status
+            playerIds.forEach(playerId => {
+                updates[`players/${playerId}/hasActed`] = false;
+                updates[`players/${playerId}/currentBet`] = 0;
+            });
+            
+            // Reset current bet
+            updates[`gameState/currentBet`] = 0;
+            
+            // Determine next betting round
+            switch(gameStateData.bettingRound) {
+                case 'preflop':
+                    // Deal flop
+                    const flopCards = gameStateData.deck.splice(0, 3);
+                    updates[`gameState/communityCards`] = flopCards;
+                    updates[`gameState/bettingRound`] = 'flop';
+                    updates[`gameState/deck`] = gameStateData.deck;
+                    updates[`gameState/currentPlayer`] = playerIds[0]; // Start with first player
+                    addLogEntry("*** FLOP ***");
+                    break;
+                    
+                case 'flop':
+                    // Deal turn
+                    const turnCard = gameStateData.deck.splice(0, 1)[0];
+                    updates[`gameState/communityCards`] = [...gameStateData.communityCards, turnCard];
+                    updates[`gameState/bettingRound`] = 'turn';
+                    updates[`gameState/deck`] = gameStateData.deck;
+                    updates[`gameState/currentPlayer`] = playerIds[0];
+                    addLogEntry("*** TURN ***");
+                    break;
+                    
+                case 'turn':
+                    // Deal river
+                    const riverCard = gameStateData.deck.splice(0, 1)[0];
+                    updates[`gameState/communityCards`] = [...gameStateData.communityCards, riverCard];
+                    updates[`gameState/bettingRound`] = 'river';
+                    updates[`gameState/deck`] = gameStateData.deck;
+                    updates[`gameState/currentPlayer`] = playerIds[0];
+                    addLogEntry("*** RIVER ***");
+                    break;
+                    
+                case 'river':
+                    // Showdown - end hand
+                    updates[`gameState/bettingRound`] = 'showdown';
+                    updates[`gameState/currentPlayer`] = null;
+                    addLogEntry("*** SHOWDOWN ***");
+                    // In a real game, you'd evaluate hands here
+                    setTimeout(() => startNewHand(createDeck()), 3000);
+                    break;
+            }
+            
+            return database.ref('games/' + gameState.gameId).update(updates);
         }
 
         // Show betting controls
@@ -1049,36 +1378,20 @@
 
         // Enable player actions
         function enablePlayerActions() {
-            const actions = [checkBtn, callBtn, betBtn, raiseBtn, foldBtn];
-            actions.forEach(btn => btn.disabled = false);
+            checkBtn.disabled = false;
+            callBtn.disabled = false;
+            betBtn.disabled = false;
+            raiseBtn.disabled = false;
+            foldBtn.disabled = false;
         }
 
         // Disable player actions
         function disablePlayerActions() {
-            const actions = [checkBtn, callBtn, betBtn, raiseBtn, foldBtn];
-            actions.forEach(btn => btn.disabled = true);
-        }
-
-        // Start new hand (host only)
-        function startNewHand() {
-            if (!gameState.isHost) return;
-            
-            // Simple card dealing logic
-            const communityCards = [
-                { suit: 'hearts', value: '10' },
-                { suit: 'diamonds', value: '7' },
-                { suit: 'clubs', value: '2' }
-            ];
-            
-            const gameStateUpdate = {
-                phase: 'flop',
-                communityCards: communityCards,
-                pot: 50,
-                currentBet: 20,
-                currentPlayer: Object.keys(gameState.players)[0] // First player
-            };
-            
-            database.ref('games/' + gameState.gameId + '/gameState').update(gameStateUpdate);
+            checkBtn.disabled = true;
+            callBtn.disabled = true;
+            betBtn.disabled = true;
+            raiseBtn.disabled = true;
+            foldBtn.disabled = true;
         }
 
         // Send chat message
@@ -1134,6 +1447,7 @@
             handResultEl.textContent = '';
             logEntriesEl.innerHTML = '<div class="log-entry">Welcome to Firebase Poker!</div>';
             chatMessagesEl.innerHTML = '<div class="log-entry">System: Welcome to the table!</div>';
+            disablePlayerActions();
         }
 
         // Initialize the game when page loads
